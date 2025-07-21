@@ -1113,7 +1113,12 @@ def downscale_floodmap(
                                     "xc": (("y", "x"), x_coords),
                                 },
                             )
+
+                    # make sure the nodata value and crs are set
                     block_dep.raster.set_crs(src.crs.to_epsg())
+                    if indices is not None:
+                        block_indices.raster.set_nodata(int(indices_src.nodata))
+                        block_indices.raster.set_crs(indices_src.crs.to_epsg())
 
                     block_hmax = _downscale_floodmap_da(
                         zsmax=zsmax,
