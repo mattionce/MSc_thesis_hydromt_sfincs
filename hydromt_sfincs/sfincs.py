@@ -70,6 +70,7 @@ class SfincsModel(GridModel):
     }
     _FORCING_SPW = {"spiderweb": "spw"}  # TODO add read and write functions
     _MAPS = ["msk", "dep", "scs", "manning", "qinf", "smax", "seff", "ks", "vol"]
+    _QT_MAPS = ["vol"]
     _STATES = ["rst", "ini"]
     _FOLDERS = []
     _CLI_ARGS = {"region": "setup_grid_from_region", "res": "setup_grid_from_region"}
@@ -1742,23 +1743,23 @@ class SfincsModel(GridModel):
         height: Union[float, List[float]] = None,
         merge: bool = True,
     ):
-        """Setup storage volume.
+        """Add storage volumes to the model. Note that this functionality only works for models
+        with subgrid tables (regular grid or quadtree).
 
         Adds model layer:
-        * **vol** map: storage volume for green infrastructure
+        * **vol** map: storage volume [m3] for green infrastructure
 
         Parameters
         ----------
-        storage_locs : str, Path
-            Path, data source name, or geopandas object to storage location polygon or point geometry file.
-            Optional "volume" or "height" attributes can be provided to set the storage volume.
-        volume : float, optional
-            Storage volume [m3], by default None
-        height : float, optional
-            Storage height [m], by default None
+        storage_locs : str, Path, or gpd.GeoDataFrame
+            Storage location polygons or points. May include "volume" or "height" attributes.
+        volume : float or list of float, optional
+            Storage volume [m3] per location. Used if not present in storage_locs.
+        height : float or list of float, optional
+            Storage height [m] per polygon. Used if not present in storage_locs.
+            Only applies to polygons.
         merge : bool, optional
-            If True, merge with existing storage volumes, by default True.
-
+            If True, add to existing storage volumes. Default is True.
         """
 
         # read, clip and reproject
@@ -1790,6 +1791,27 @@ class SfincsModel(GridModel):
             self.set_grid(da_vol, name=mname)
             # update config
             self.set_config(f"{mname}file", f"sfincs.{mname[:3]}")
+        elif self.grid_type == "quadtree":
+            if merge and "vol" in self.quadtree.data:
+                da_vol = self.quadtree.data["vol"]
+            else:
+                da_vol = xu.full_like(self.mask, 0, dtype=np.float64)
+
+            # add storage volumes form gdf to da_vol
+            da_vol = workflows.add_storage_volume_qt(
+                da_vol,
+                gdf,
+                volume=volume,
+                height=height,
+                logger=self.logger,
+            )
+
+            mname = "vol"
+            da_vol.attrs.update(**self._ATTRS.get(mname, {}))
+            self.quadtree.data[mname] = da_vol
+            # update config
+            fname = self._ATTRS.get(mname)["standard_name"].replace(" ", "_")
+            self.set_config(f"{mname}file", f"{fname}.nc")
 
     ### FORCING
     def set_forcing_1d(
@@ -2899,16 +2921,7 @@ class SfincsModel(GridModel):
         self.read_config(epsg=epsg)
         if epsg is None and "epsg" not in self.config:
             raise ValueError("Please specify epsg to read this model")
-        if self.grid_type == "regular":
-            self.read_grid()
-        elif self.grid_type == "quadtree":
-            fn = self.get_config("qtrfile", fallback="sfincs.nc", abs_path=True)
-            if not isfile(fn):
-                raise IOError(f".nc path {fn} does not exist")
-            self.quadtree.read(file_name=fn)
-            # remove grid from api and model
-            self._API.pop("grid", None)
-            self._grid = None
+        self.read_grid()
         self.read_subgrid()
         self.read_geoms()
         self.read_forcing()
@@ -2917,12 +2930,7 @@ class SfincsModel(GridModel):
     def write(self):
         """Write the complete model schematization and configuration to file."""
         self.logger.info(f"Writing model data to {self.root}")
-        # TODO - add check for subgrid & quadtree > give flags to self.write_grid() and self.write_config()
-        if self.grid_type == "regular":
-            self.write_grid()
-        elif self.grid_type == "quadtree":
-            fn = self.get_config("qtrfile", abs_path=True)
-            self.quadtree.write(file_name=fn)
+        self.write_grid()
         self.write_subgrid()
         self.write_geoms()
         self.write_forcing()
@@ -2937,7 +2945,8 @@ class SfincsModel(GridModel):
         #     self.logger.error(f"Error writing data catalog: {str(e)}")
 
     def read_grid(self, data_vars: Union[List, str] = None) -> None:
-        """Read SFINCS binary grid files and save to `grid` attribute.
+        """Read SFINCS binary grid files and save to `grid` attribute
+        or read netcdf quadtree files and store in `quadtree` attribute.
         Filenames are taken from the `config` attribute (i.e. input file).
 
         Parameters
@@ -2945,72 +2954,104 @@ class SfincsModel(GridModel):
         data_vars : Union[List, str], optional
             List of data variables to read, by default None (all)
         """
-        if self._grid is None:
-            self._grid = xr.Dataset()  # avoid reading grid twice
+        self._assert_read_mode
 
-        da_lst = []
-        if data_vars is None:
-            data_vars = self._MAPS
-        elif isinstance(data_vars, str):
-            data_vars = list(data_vars)
+        if self.grid_type is None:
+            raise ValueError(
+                "Grid type is not set. Please read configuration file (sfincs.inp) first."
+            )
 
-        # read index file
-        ind_fn = self.get_config("indexfile", fallback="sfincs.ind", abs_path=True)
-        if not isfile(ind_fn):
-            raise IOError(f".ind path {ind_fn} does not exist")
+        elif self.grid_type == "regular":
+            if self._grid is None:
+                self._grid = xr.Dataset()  # avoid reading grid twice
 
-        dtypes = {"msk": "u1"}
-        mvs = {"msk": 0}
-        if self.reggrid is not None:
-            ind = self.reggrid.read_ind(ind_fn=ind_fn)
+            da_lst = []
+            if data_vars is None:
+                data_vars = self._MAPS
+            elif isinstance(data_vars, str):
+                data_vars = list(data_vars)
 
-            for name in data_vars:
-                if f"{name}file" in self.config:
-                    fn = self.get_config(
-                        f"{name}file", fallback=f"sfincs.{name}", abs_path=True
-                    )
-                    if not isfile(fn):
-                        self.logger.warning(f"{name}file not found at {fn}")
-                        continue
-                    dtype = dtypes.get(name, "f4")
-                    mv = mvs.get(name, -9999.0)
-                    da = self.reggrid.read_map(fn, ind, dtype, mv, name=name)
-                    da_lst.append(da)
-            ds = xr.merge(da_lst)
-            epsg = self.config.get("epsg", None)
-            if epsg is not None:
-                ds.raster.set_crs(epsg)
-            self.set_grid(ds)
+            # read index file
+            ind_fn = self.get_config("indexfile", fallback="sfincs.ind", abs_path=True)
+            if not isfile(ind_fn):
+                raise IOError(f".ind path {ind_fn} does not exist")
 
-            # TODO - fix this properly; but to create overlays in GUIs,
-            # we always convert regular grids to a UgridDataArray
-            self.quadtree = QuadtreeGrid(logger=self.logger)
-            if self.config.get("rotation", 0) != 0:  # This is a rotated regular grid
-                self.quadtree.data = UgridDataArray.from_structured(
-                    self.mask, "xc", "yc"
-                )
-            else:
-                self.quadtree.data = UgridDataArray.from_structured(self.mask)
-            self.quadtree.data.grid.set_crs(self.crs)
+            dtypes = {"msk": "u1"}
+            mvs = {"msk": 0}
+            if self.reggrid is not None:
+                ind = self.reggrid.read_ind(ind_fn=ind_fn)
 
-            # keep some metadata maps from gis directory
-            fns = glob.glob(join(self.root, "gis", "*.tif"))
-            fns = [
-                fn
-                for fn in fns
-                if basename(fn).split(".")[0] not in self.grid.data_vars
-            ]
-            if fns:
-                ds = hydromt.open_mfraster(fns).load()
+                for name in data_vars:
+                    if f"{name}file" in self.config:
+                        fn = self.get_config(
+                            f"{name}file", fallback=f"sfincs.{name}", abs_path=True
+                        )
+                        if not isfile(fn):
+                            self.logger.warning(f"{name}file not found at {fn}")
+                            continue
+                        dtype = dtypes.get(name, "f4")
+                        mv = mvs.get(name, -9999.0)
+                        da = self.reggrid.read_map(fn, ind, dtype, mv, name=name)
+                        da_lst.append(da)
+                ds = xr.merge(da_lst)
+                epsg = self.config.get("epsg", None)
+                if epsg is not None:
+                    ds.raster.set_crs(epsg)
                 self.set_grid(ds)
-                ds.close()
+
+                # TODO - fix this properly; but to create overlays in GUIs,
+                # we always convert regular grids to a UgridDataArray
+                self.quadtree = QuadtreeGrid(logger=self.logger)
+                if (
+                    self.config.get("rotation", 0) != 0
+                ):  # This is a rotated regular grid
+                    self.quadtree.data = UgridDataArray.from_structured(
+                        self.mask, "xc", "yc"
+                    )
+                else:
+                    self.quadtree.data = UgridDataArray.from_structured(self.mask)
+                self.quadtree.data.grid.set_crs(self.crs)
+
+                # keep some metadata maps from gis directory
+                fns = glob.glob(join(self.root, "gis", "*.tif"))
+                fns = [
+                    fn
+                    for fn in fns
+                    if basename(fn).split(".")[0] not in self.grid.data_vars
+                ]
+                if fns:
+                    ds = hydromt.open_mfraster(fns).load()
+                    self.set_grid(ds)
+                    ds.close()
+
+        elif self.grid_type == "quadtree":
+            fn = self.get_config("qtrfile", fallback="sfincs.nc", abs_path=True)
+            if not isfile(fn):
+                raise IOError(f".nc path {fn} does not exist")
+            # check which seperate data variables should be read
+            if data_vars is None:
+                data_vars = self._QT_MAPS
+            elif isinstance(data_vars, str):
+                data_vars = list(data_vars)
+            variables = []
+            for var in data_vars:
+                fn_var = self.get_config(
+                    f"{var}file", fallback=f"{var}.nc", abs_path=True
+                )
+                if isfile(fn_var):
+                    variables.append({"variable": var, "file_name": fn_var})
+            self.quadtree.read(file_name=fn, variables=variables)
+            # remove grid from api and model
+            self._API.pop("grid", None)
+            self._grid = None
 
     def write_grid(self, data_vars: Union[List, str] = None):
-        """Write SFINCS grid to binary files including map index file.
-        Filenames are taken from the `config` attribute (i.e. input file).
+        """Write SFINCS grid to binary files including map index file for regular models,
+        and to netcdf files for quadtree models. Filenames are taken from the `config`
+        attribute (i.e. input file).
 
         If `write_gis` property is True, all grid variables are written to geotiff
-        files in a "gis" subfolder.
+        files in a "gis" subfolder (for regular models).
 
         Parameters
         ----------
@@ -3019,38 +3060,54 @@ class SfincsModel(GridModel):
         """
         self._assert_write_mode
 
-        dtypes = {"msk": "u1"}  # default to f4
-        if self.reggrid and len(self.grid.data_vars) > 0 and "msk" in self.grid:
-            # make sure orientation is S->N
-            ds_out = self.grid
-            if ds_out.raster.res[1] < 0:
-                ds_out = ds_out.raster.flipud()
-            mask = ds_out["msk"].values
+        if self.grid_type == "regular":
+            dtypes = {"msk": "u1"}  # default to f4
+            if self.reggrid and len(self.grid.data_vars) > 0 and "msk" in self.grid:
+                # make sure orientation is S->N
+                ds_out = self.grid
+                if ds_out.raster.res[1] < 0:
+                    ds_out = ds_out.raster.flipud()
+                mask = ds_out["msk"].values
 
-            self.logger.debug("Write binary map indices based on mask.")
-            ind_fn = self.get_config("indexfile", abs_path=True)
-            self.reggrid.write_ind(ind_fn=ind_fn, mask=mask)
+                self.logger.debug("Write binary map indices based on mask.")
+                ind_fn = self.get_config("indexfile", abs_path=True)
+                self.reggrid.write_ind(ind_fn=ind_fn, mask=mask)
 
-            if data_vars is None:  # write all maps
-                data_vars = [v for v in self._MAPS if v in ds_out]
+                if data_vars is None:  # write all maps
+                    data_vars = [v for v in self._MAPS if v in ds_out]
+                elif isinstance(data_vars, str):
+                    data_vars = list(data_vars)
+                self.logger.debug(f"Write binary map files: {data_vars}.")
+                for name in data_vars:
+                    if f"{name}file" not in self.config:
+                        self.set_config(f"{name}file", f"sfincs.{name}")
+                    # do not write depfile if subgrid is used
+                    if (name == "dep" or name == "manning") and self.subgrid:
+                        continue
+                    self.reggrid.write_map(
+                        map_fn=self.get_config(f"{name}file", abs_path=True),
+                        data=ds_out[name].values,
+                        mask=mask,
+                        dtype=dtypes.get(name, "f4"),
+                    )
+
+            # TODO implement something like this for unstructured grids
+            if self._write_gis:
+                self.write_raster("grid")
+
+        elif self.grid_type == "quadtree":
+            fn = self.get_config("qtrfile", abs_path=True)
+            # check which data variables should be written separately
+            if data_vars is None:
+                data_vars = self._QT_MAPS
             elif isinstance(data_vars, str):
                 data_vars = list(data_vars)
-            self.logger.debug(f"Write binary map files: {data_vars}.")
-            for name in data_vars:
-                if f"{name}file" not in self.config:
-                    self.set_config(f"{name}file", f"sfincs.{name}")
-                # do not write depfile if subgrid is used
-                if (name == "dep" or name == "manning") and self.subgrid:
-                    continue
-                self.reggrid.write_map(
-                    map_fn=self.get_config(f"{name}file", abs_path=True),
-                    data=ds_out[name].values,
-                    mask=mask,
-                    dtype=dtypes.get(name, "f4"),
-                )
-
-        if self._write_gis:
-            self.write_raster("grid")
+            variables = []
+            for var in data_vars:
+                fn_var = self.get_config(f"{var}file", abs_path=True)
+                if fn_var is not None:
+                    variables.append({"variable": var, "file_name": fn_var})
+            self.quadtree.write(file_name=fn, variables=variables)
 
     def read_subgrid(self):
         """Read SFINCS subgrid file and add to `subgrid` attribute.
