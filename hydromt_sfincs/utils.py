@@ -4,28 +4,36 @@ as well as some common data conversions.
 """
 
 import copy
+from datetime import datetime
 import io
 import logging
 import os
-from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple, Union, Optional
+import shutil
+import tempfile
+from typing import Dict, List, Optional, Tuple, Union
 
+from affine import Affine
 import geopandas as gpd
-import hydromt
 import numpy as np
 import pandas as pd
 import rasterio
 import xarray as xr
 import xugrid as xu
+from xugrid.core.wrap import UgridDataArray
 from pyproj.crs.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.rio.overview import get_maximum_overview_level
 from rasterio.windows import Window
 from shapely.geometry import LineString, Polygon
 
-from hydromt.io import write_xy
-from hydromt.data_adapter import RasterDatasetAdapter
+import hydromt
+from hydromt.writers import write_xy
+from hydromt.readers import open_vector
+from hydromt.data_catalog.drivers import RasterioDriver
+from hydromt.gis.gis_utils import zoom_to_overview_level
+from hydromt.gis.vector import GeoDataset
+
 
 __all__ = [
     "read_binary_map",
@@ -46,6 +54,8 @@ __all__ = [
     "write_geoms",
     "read_drn",
     "write_drn",
+    "write_vector",
+    "write_raster",
     "gdf2linestring",
     "gdf2polygon",
     "linestring2gdf",
@@ -56,12 +66,13 @@ __all__ = [
     "rotated_grid",
     "build_overviews",
     "find_uv_indices",
+    "make_regular_grid",
+    "make_regular_grid_transform",
     "partition_quadtree",
-    "xu_open_dataset",
-    "check_exists_and_lazy",
+    "write_netcdf_safely",
 ]
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(f"hydromt.{__name__}")
 
 
 ## BINARY MAPS: sfincs.ind, sfincs.msk, sfincs.dep etc. ##
@@ -203,9 +214,6 @@ def write_ascii_map(fn: Union[str, Path], data: np.ndarray, fmt: str = "%8.3f") 
 
 
 ## XY files: bnd / src ##
-# write_xy defined in hydromt.io
-
-
 def read_xy(fn: Union[str, Path], crs: Union[int, CRS] = None) -> gpd.GeoDataFrame:
     """Read sfincs xy files and parse to GeoDataFrame.
 
@@ -221,7 +229,7 @@ def read_xy(fn: Union[str, Path], crs: Union[int, CRS] = None) -> gpd.GeoDataFra
     gdf: gpd.GeoDataFrame
         GeoDataFrame with point geomtries
     """
-    gdf = hydromt.open_vector(fn, crs=crs, driver="xy")
+    gdf = open_vector(fn, crs=crs, driver="xy")
     gdf.index = np.arange(1, gdf.index.size + 1, dtype=int)  # index starts at 1
     return gdf
 
@@ -236,8 +244,9 @@ def read_xyn(fn: str, crs: int = None):
         df["name"] = df.index
 
     points = gpd.points_from_xy(df["x"], df["y"])
-    gdf = gpd.GeoDataFrame(df.drop(columns=["x", "y"]), geometry=points, crs=crs)
-
+    gdf = gpd.GeoDataFrame(df.drop(columns=["x", "y"]), geometry=points)
+    if crs is not None:
+        gdf.set_crs(crs, inplace=True)
     return gdf
 
 
@@ -251,7 +260,7 @@ def write_xyn(fn: str = "sfincs.obs", gdf: gpd.GeoDataFrame = None, fmt: str = "
             try:
                 name = point["properties"]["name"]
             except:
-                name = "obs" + str(point["id"])
+                name = "point" + str(point["id"])
             string = f'{x:{fmt}} {y:{fmt}} "{name}"\n'
             fid.write(string)
 
@@ -288,7 +297,7 @@ def read_timeseries(fn: Union[str, Path], tref: Union[str, datetime]) -> pd.Data
     tref = parse_datetime(tref)
     df = pd.read_csv(fn, index_col=0, header=None, sep="\s+")
     df.index = pd.to_datetime(df.index.values, unit="s", origin=tref)
-    df.columns = df.columns.values.astype(int)
+    df.columns = df.columns.values.astype(int) - 1  # convert to zero-based index
     df.index.name = "time"
     df.columns.name = "index"
     return df
@@ -298,7 +307,7 @@ def write_timeseries(
     fn: Union[str, Path],
     df: Union[pd.DataFrame, pd.Series],
     tref: Union[str, datetime],
-    fmt: str = "%7.2f",
+    fmt: str = "%7.3f",
 ) -> None:
     """Write pandas.DataFrame to fixed width ascii timeseries files
     such as sfincs.bzs, sfincs.dis and sfincs.precip. The output time index is given in
@@ -859,6 +868,127 @@ def read_sfincs_his_results(
     return ds_his
 
 
+def write_vector(
+    data: Union[xr.Dataset, gpd.GeoDataFrame],
+    name: str,
+    root: Union[str, Path],
+    logger=logger,
+    **kwargs,
+):
+    """Write model vector (geoms) variables to geojson files.
+
+    NOTE: these files are not used by the model by just saved for visualization/
+    analysis purposes.
+
+    Parameters
+    ----------
+    data: geopandas.GeoDataFrame, xr.Dataset
+        The data to write to file. If an xr.Dataset is provided, it should contain geometry variables
+        that can be converted to a geopandas.GeoDataFrame.
+    name: str
+        The name of the variable to write to file. This will be used as the filename.
+    root: Path, str, optional
+        The output folder path.
+    kwargs:
+        Key-word arguments passed to geopandas.GeoDataFrame.to_file(driver='GeoJSON').
+    """
+    kwargs.update(driver="GeoJSON")  # fixed
+
+    # check root
+    if not os.path.isdir(root):
+        os.makedirs(root)
+
+    if isinstance(data, gpd.GeoDataFrame):
+        gdf = data
+    else:
+        try:
+            gdf = data.vector.to_gdf()
+        except:
+            logger.debug(f"Variable {name} could not be written to vector file.")
+            pass
+
+    gdf.to_file(os.path.join(root, f"{name}.geojson"), **kwargs)
+
+
+def write_raster(
+    data: Union[xr.Dataset, xr.DataArray],
+    root: Union[str, Path],
+    mask: xr.DataArray = None,
+    driver="GTiff",
+    compress="deflate",
+    logger=logger,
+    **kwargs,
+):
+    """Write model 2D raster variables to geotiff files.
+
+    NOTE: these files are not used by the model by just saved for visualization/
+    analysis purposes.
+
+    Parameters
+    ----------
+    variables: str, list, optional
+        Model variables are a combination of attribute and layer (optional) using <attribute>.<layer> syntax.
+        Known ratster attributes are ["grid", "states", "results"].
+        Different variables can be combined in a list.
+        By default, variables is ["grid", "states", "results.hmax"]
+    root: Path, str, optional
+        The output folder path. If None it defaults to the <model_root>/gis folder (Default)
+    kwargs:
+        Key-word arguments passed to hydromt.RasterDataset.to_raster(driver='GTiff', compress='lzw').
+    """
+
+    # check variables
+    if isinstance(data, xr.Dataset):
+        variables = list(data.data_vars.keys())
+        variables = [variables]
+    elif isinstance(data, xr.DataArray):
+        variables = [data.name]
+    else:
+        raise ValueError(
+            f"Unsupported data type for writing raster: {type(data)}. "
+            "Expected xr.Dataset or xr.DataArray."
+        )
+
+    # check mask
+    if mask is None:
+        if "mask" in data:
+            mask = data["mask"]
+        else:
+            raise ValueError("No mask provided and no 'mask' variable found in data.")
+
+    # check root
+    if not os.path.isdir(root):
+        os.makedirs(root)
+
+    # save to file
+    for var in variables:
+        da = data[var] if isinstance(data, xr.Dataset) else data
+        name = da.name
+        if len(da.dims) != 2:
+            # try to reduce to 2D by taking maximum over time dimension
+            if "time" in da.dims:
+                da = da.max("time")
+            elif "timemax" in da.dims:
+                da = da.max("timemax")
+            # if still not 2D, skip
+            if len(da.dims) != 2:
+                logger.warning(f"Variable {name} has more than 2 dimensions: skipping.")
+                continue
+        # If the raster type is float, set nodata to np.nan
+        if da.dtype == "float32" or da.dtype == "float64":
+            da.raster.set_nodata(np.nan)
+        # only write active cells to gis files
+        da = da.where(mask > 0, da.raster.nodata).raster.mask_nodata()
+        if da.raster.res[1] > 0:  # make sure orientation is N->S
+            da = da.raster.flipud()
+        da.raster.to_raster(
+            os.path.join(root, f"{name}.tif"),
+            driver=driver,
+            compress=compress,
+            **kwargs,
+        )
+
+
 def downscale_floodmap(
     zsmax: Union[xr.DataArray, xu.UgridDataArray],
     dep: Union[Path, str, xr.DataArray],
@@ -980,9 +1110,13 @@ def downscale_floodmap(
             )
 
         if zoom_level is not None:
-            source = RasterDatasetAdapter(dep)
-            source._get_zoom_levels_and_crs()
-            overview_level = source._parse_zoom_level(zoom_level=zoom_level)
+            zls_dict, crs = RasterioDriver._get_zoom_levels_and_crs(dep)
+            overview_level = zoom_to_overview_level(
+                zoom=zoom_level, zls_dict=zls_dict, source_crs=crs
+            )
+            if overview_level:
+                # NOTE: overview levels start at zoom_level 1, see _get_zoom_levels_and_crs
+                overview_level -= 1
         else:
             # use highest resolution by default
             overview_level = 0
@@ -1436,37 +1570,317 @@ def binary_search(vals, val):
     return None
 
 
-def xu_open_dataset(*args, **kwargs):
-    """This function is a replacement of xu.open_dataset.
-
-    It exists because xu.open_dataset does not close the file after opening, which can lead to Permission Errors.
+def make_regular_grid(
+    x0,
+    y0,
+    dx,
+    dy,
+    mmax,
+    nmax,
+    rotation=0.0,
+    crs=None,
+    mmin=0,
+    nmin=0,
+    refi=1,
+    name="var",
+    dtype=float,
+    fill_value=np.nan,
+    uv_points=False,
+    make_ugrid=False,
+):
     """
-    with xr.open_dataset(*args, **kwargs) as ds:
-        return xu.UgridDataset(ds)
-
-
-def check_exists_and_lazy(ds, file_name):
-    """If a netcdf file is read lazily, the file can not be overwritten.
-    This function checks whether the file already exists, if so, it checks
-    if the data is lazily loaded. If so, data should be loaded before writing.
+    Create an xarray.DataArray with spatial coordinates based on grid definition.
 
     Parameters
     ----------
-    ds : xarray.Dataset, xu.UgridDataset
-        The dataset to be written to a netcdf file.
-    file_name : str
-        The path to the netcdf file.
+    x0, y0 : float
+        Origin (lower-left corner) in physical coordinates.
+    dx, dy : float
+        Grid spacing in x and y directions (coarse resolution).
+    mmin, mmax, nmin, nmax : int
+        Grid index bounds.
+    refi : int
+        Refinement factor (number of subcells per coarse cell).
+    rotation : float
+        Rotation angle in degrees.
+    uv_points : bool, optional
+        If True, place points at cell corners (UV points);
+        if False, place points at cell centers (default).
     """
-    if not os.path.exists(file_name):
-        return
 
-    # Check for lazy loading
-    lazy_vars = [not data_array._in_memory for data_array in ds.data_vars.values()]
+    # Refined spacing
+    dxp, dyp = dx / refi, dy / refi
 
-    # if all(lazy_vars):
-    #     return  # All variables are lazy-loaded, skip writing?
+    # Number of points; 1 coarse cell extra for uv_points
+    nx = (mmax - mmin + int(uv_points)) * refi
+    ny = (nmax - nmin + int(uv_points)) * refi
 
-    if any(lazy_vars):
-        ds.load()  # Some variables are lazy-loaded, load them into memory
-        ds.close()
-    return
+    # Index ranges
+    m_range = np.arange(nx)
+    n_range = np.arange(ny)
+
+    # Offset in grid units
+    offset_x = 0.5 * dxp + mmin * dx - (0.5 * dx if uv_points else 0)
+    offset_y = 0.5 * dyp + nmin * dy - (0.5 * dy if uv_points else 0)
+
+    # Affine transform
+    transform = (
+        Affine.translation(x0, y0) * Affine.rotation(rotation) * Affine.scale(dxp, dyp)
+    )
+
+    # Generate coordinates
+    if transform.b == 0.0:  # No rotation → rectilinear
+        x_coords, _ = transform * (
+            m_range + offset_x / dxp,
+            np.zeros(nx) + offset_y / dyp,
+        )
+        _, y_coords = transform * (
+            np.zeros(ny) + offset_x / dxp,
+            n_range + offset_y / dyp,
+        )
+        coords = {
+            "m": ("x", m_range + mmin * refi),
+            "n": ("y", n_range + nmin * refi),
+            "x": x_coords,
+            "y": y_coords,
+        }
+        dims = ("y", "x")
+    else:  # With rotation → 2D coordinate arrays
+        m_mesh, n_mesh = np.meshgrid(m_range, n_range)
+        x_coords, y_coords = transform * (
+            m_mesh + offset_x / dxp,
+            n_mesh + offset_y / dyp,
+        )
+        coords = {
+            "m": ("x", m_range + mmin * refi),
+            "n": ("y", n_range + nmin * refi),
+            "xc": (("y", "x"), x_coords),
+            "yc": (("y", "x"), y_coords),
+        }
+        dims = ("y", "x")
+
+    # DataArray with fill value
+    data = np.full((ny, nx), fill_value, dtype=dtype)
+    da = xr.DataArray(data, dims=dims, coords=coords, name=name)
+
+    # CRS/Ugrid handling
+    if make_ugrid:
+        if rotation != 0.0:
+            da = UgridDataArray.from_structured(da, "xc", "yc")
+        else:
+            da = UgridDataArray.from_structured(da)
+        if crs is not None:
+            da.grid.set_crs(crs)
+    else:
+        if crs is not None:
+            da.raster.set_crs(crs)
+
+    return da
+
+
+def make_regular_grid_transform(
+    x0, y0, dx, dy, mmax, nmax, mmin=0, nmin=0, rotation=0.0, refi=1, uv_points=False
+):
+    """
+    Compute affine transform for a regular grid
+    (possibly rotated) without allocating arrays. The affine corresponds
+    to the **bottom-left corner** of the first pixel (raster convention),
+    while preserving original UV offset logic.
+    """
+    dxp = dx / refi
+    dyp = dy / refi
+
+    if uv_points:
+        width = (mmax - mmin + 1) * refi
+        height = (nmax - nmin + 1) * refi
+    else:
+        width = (mmax - mmin) * refi
+        height = (nmax - nmin) * refi
+
+    # offset in pixel units like make_regular_grid
+    if uv_points:
+        offset_x = 0.5 * dxp + mmin * dx - 0.5 * dx
+        offset_y = 0.5 * dyp + nmin * dy - 0.5 * dy
+    else:
+        offset_x = 0.5 * dxp + mmin * dx
+        offset_y = 0.5 * dyp + nmin * dy
+
+    if rotation == 0.0:
+        # non-rotated: simple translation
+        tx = x0 + offset_x - 0.5 * dxp
+        ty = y0 + offset_y - 0.5 * dyp
+        transform = Affine.translation(tx, ty) * Affine.scale(dxp, dyp)
+    else:
+        # rotated: compute cos/sin once
+        theta = np.deg2rad(rotation)
+        cosrot = np.cos(theta)
+        sinrot = np.sin(theta)
+
+        # apply the half-cell shift in rotated coordinates
+        x0_shifted = (
+            x0 + (offset_x - 0.5 * dxp) * cosrot - (offset_y - 0.5 * dyp) * sinrot
+        )
+        y0_shifted = (
+            y0 + (offset_x - 0.5 * dxp) * sinrot + (offset_y - 0.5 * dyp) * cosrot
+        )
+
+        # base affine for rotation and scaling
+        transform = (
+            Affine.translation(x0_shifted, y0_shifted)
+            * Affine.rotation(rotation)
+            * Affine.scale(dxp, dyp)
+        )
+
+    return transform, width, height
+
+
+def partition_quadtree(
+    quadtree: xu.UgridDataset,
+    partition_by_level: bool = True,
+    partition_in_blocks: bool = True,
+    nrmax: int = 2000,
+    logger=logger,
+):
+    """Partition a 2D unstructured grid into blocks.
+
+    Parameters
+    ----------
+    quadtree : xu.UgridDataset
+        Unstructured 2D grid.
+    partition_by_level : bool, optional
+        Partition by level, by default True
+    partition_in_blocks : bool, optional
+        Partition in blocks, by default False
+    nrmax : int, optional
+        Maximum number of cells per block, by default 2000
+
+    Returns
+    -------
+    Partitions : List[xu.UgridDataset]
+        List of partitiones, by levels, in spatial blocks, or both.
+    """
+
+    if partition_by_level:
+        if "level" not in quadtree:
+            raise ValueError("No 'level' attribute found in quadtree.")
+        partitions = quadtree.ugrid.partition_by_label(quadtree["level"] - 1)
+    else:
+        partitions = [quadtree]
+
+    partitions_new = []
+    if partition_in_blocks:
+        for level, partition in enumerate(partitions):
+            if len(partition.coords["mesh2d_nFaces"]) > 0:
+                logger.debug(
+                    f"Partition level {level} has {len(partition.coords['mesh2d_nFaces'])} faces: "
+                )
+
+                # approximate nr of cells in x and y direction based on resolution (to prevent too large datasets loaded in memory)
+                dx = partition.dx / (2**level)
+                dy = partition.dy / (2**level)
+                logger.debug(f"dx, dy:  {dx}, {dy}")
+                xmin, ymin, xmax, ymax = partition.ugrid.grid.bounds
+                nmax = int(np.ceil((ymax - ymin) / dy))
+                mmax = int(np.ceil((xmax - xmin) / dx))
+                logger.debug(f"mmax: {mmax}, nmax: {nmax}")
+
+                # check if partition is too large and split in smaller blocks
+                nrbn = int(np.ceil(nmax / nrmax))  # nr of blocks in n direction
+                nrbm = int(np.ceil(mmax / nrmax))  # nr of blocks in m direction
+
+                # if too large, split on spatial extent (so not the traditional partitions ...)
+                if nrbn > 1 or nrbm > 1:
+                    logger.debug(
+                        f"Partition level {level} is too large, splitting in {nrbn} x {nrbm} blocks"
+                    )
+                    # Create coordinate ranges for slicing
+                    x_edges = np.linspace(xmin, xmax, nrbm + 1)
+                    y_edges = np.linspace(ymin, ymax, nrbn + 1)
+                    # Generate all index pairs in a vectorized manner
+                    index_pairs = np.array(
+                        np.meshgrid(np.arange(nrbm), np.arange(nrbn))
+                    ).T.reshape(-1, 2)
+                    # Use a list comprehension with vectorized index pairs
+                    subsets = [
+                        partition.ugrid.sel(
+                            x=slice(x_edges[ii], x_edges[ii + 1]),
+                            y=slice(y_edges[jj], y_edges[jj + 1]),
+                        )
+                        for ii, jj in index_pairs
+                    ]
+                    for subset in subsets:
+                        if len(subset.coords["mesh2d_nFaces"]) > 0:
+                            # subset.level = level
+                            partitions_new.append(subset)
+                else:
+                    # partition.level = level
+                    partitions_new.append(partition)
+
+    if len(partitions_new) > 0:
+        return partitions_new
+    else:
+        return partitions
+
+
+def write_netcdf_safely(ds, abs_file_path: Path) -> Path:
+    """
+    NetCDF files have the tendency to get locked by other processes (e.g. other notebooks), or because they were
+    opened in a lazy manner. This function attempts to write the dataset to the specified path,
+    only when it actually changed, and if the file is locked, it will create a versioned file instead.
+
+    Parameters
+    ----------
+    ds : xarray.Dataset or GeoDataset
+        Dataset to write (should already have CRS if needed).
+    abs_file_path : Path
+        Absolute target path for the NetCDF file.
+
+    Returns
+    -------
+    Path
+        The path the dataset was actually written to (may be versioned if original locked).
+    """
+    ds = ds.load()  # ensure fully in memory
+
+    # Step 1: skip if file exists and dataset is unchanged
+    if abs_file_path.exists():
+        try:
+            existing_ds = GeoDataset.from_netcdf(
+                abs_file_path, crs=ds.raster.crs, chunks="auto"
+            )
+            changed = not ds.equals(existing_ds)
+            existing_ds.close()
+        except Exception:
+            changed = True  # fail-safe
+
+        if not changed:
+            logger.info(f"No changes detected; skipping write to {abs_file_path}")
+            return abs_file_path
+
+    # Step 2: write to temporary file
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".nc", dir=abs_file_path.parent)
+    os.close(tmp_fd)
+    ds.vector.to_xy().to_netcdf(tmp_path)
+
+    # Step 3: move temp file to target, or create versioned file if locked
+    try:
+        shutil.move(tmp_path, abs_file_path)
+        final_path = abs_file_path
+    except PermissionError:
+        # File is locked — create versioned file
+        base, ext, parent = (
+            abs_file_path.stem,
+            abs_file_path.suffix,
+            abs_file_path.parent,
+        )
+        i = 1
+        while True:
+            versioned_path = parent / f"{base}_v{i}{ext}"
+            if not versioned_path.exists():
+                break
+            i += 1
+        shutil.move(tmp_path, versioned_path)
+        logger.warning(f"Original file locked. Saved new version as {versioned_path}")
+        final_path = versioned_path
+
+    return final_path

@@ -1,9 +1,9 @@
 """Plotting functions for SFINCS model data."""
 
+import logging
 from typing import Dict, List, Tuple, Union
 
 import numpy as np
-import logging
 import pandas as pd
 import xarray as xr
 import xugrid as xu
@@ -18,8 +18,8 @@ geom_style = {
     "rivers": dict(linestyle="-", linewidth=1.0, color="darkblue"),
     "rivers_inflow": dict(linestyle=":", linewidth=1.0, color="darkblue"),
     "rivers_outflow": dict(linestyle=":", linewidth=1.0, color="darkgreen"),
-    "msk2": dict(linestyle="-", linewidth=1.5, color="r"),
-    "msk3": dict(linestyle="-", linewidth=1.5, color="m"),
+    "mask2": dict(linestyle="-", linewidth=1.5, color="r"),
+    "mask3": dict(linestyle="-", linewidth=1.5, color="m"),
     "thd": dict(linestyle="-", linewidth=1.0, color="k", annotate=False),
     "weir": dict(linestyle="--", linewidth=1.0, color="k", annotate=False),
     "bnd": dict(marker="^", markersize=75, c="w", edgecolor="k", annotate=True),
@@ -28,6 +28,16 @@ geom_style = {
     "crs": dict(linestyle="-", linewidth=1.5, color="deeppink", annotate=False),
     "region": dict(ls="--", linewidth=1, color="r"),
 }
+
+# %% Original HydroMT-SFINCS setup_ functions:
+# plot_basemap
+# plot_forcing
+# To add: geom_style?
+
+# %% core HydroMT-SFINCS functions:
+# _initialize
+# plot_forcing
+# plot_basemap
 
 
 def plot_forcing(forcing: Dict, **kwargs):
@@ -82,14 +92,13 @@ def plot_forcing(forcing: Dict, **kwargs):
             or name.startswith("wind10_v")
         ):
             df.plot.line(ax=axes[i])
-        elif name.startswith("wnd"):
-            df.plot(ax=axes[i], kind="line", secondary_y="dir", legend=False)
+        elif name.startswith("wind"):
+            df.plot(ax=axes[i], kind="line", secondary_y="direction", legend=False)
             # set tick color for y-axis of variable 1
             axes[i].tick_params(axis="y", labelcolor="C0")
             axes[i].right_ax.set_ylabel("Wind direction [degrees]")
             # set tick color and label for y-axis of variable 2
             axes[i].right_ax.tick_params(axis="y", labelcolor="C1")
-
         else:
             df.plot.line(ax=axes[i]).legend(
                 title="index",
@@ -141,7 +150,7 @@ def plot_basemap(
     shaded : bool, optional
         Add shade to variable (only for variable = 'dep'), by default False
     plot_bounds : bool, optional
-        Add waterlevel (msk=2) and open (msk=3) boundary conditions to plot.
+        Add waterlevel (mask=2) and open (mask=3) boundary conditions to plot.
     plot_region : bool, optional
         If True, plot region outline.
     plot_geoms : bool, optional
@@ -262,8 +271,9 @@ def plot_basemap(
     kwargs0.update(kwargs)
     # make nice cmap
     if "cmap" not in kwargs or "norm" not in kwargs:
-        if variable == "dep" and "dep" in ds:
-            vmin, vmax = ds["dep"].raster.mask_nodata().quantile([0.0, 0.98]).values
+        depth_vars = ["dep", "z"]
+        if variable in depth_vars and variable in ds:
+            vmin, vmax = ds[variable].raster.mask_nodata().quantile([0.0, 0.98]).values
             vmin, vmax = int(kwargs.pop("vmin", vmin)), int(kwargs.pop("vmax", vmax))
             c_dem = plt.cm.terrain(np.linspace(0.25, 1, vmax))
             if vmin < 0:
@@ -273,7 +283,7 @@ def plot_basemap(
             norm = colors.Normalize(vmin=vmin, vmax=vmax)
             cmap, norm = kwargs.pop("cmap", cmap), kwargs.pop("norm", norm)
             kwargs0.update(norm=norm, cmap=cmap)
-        elif variable == "msk" and "msk" in ds:
+        elif variable == "mask" and "mask" in ds:
             cmap = colors.LinearSegmentedColormap.from_list(
                 "Set1", ["grey", "r", "m"], N=3
             )
@@ -283,8 +293,8 @@ def plot_basemap(
 
     if variable in ds:
         da = ds[variable]
-        if "msk" in ds and np.any(ds["msk"] > 0):
-            da = da.where(ds["msk"] > 0)
+        if "mask" in ds and np.any(ds["mask"] > 0):
+            da = da.where(ds["mask"] > 0)
         if isinstance(da, xr.DataArray):
             # mask_nodata converts it to an xr.DataArray, so performed inside if-else statement
             da = da.raster.mask_nodata()
@@ -325,24 +335,26 @@ def plot_basemap(
         ],
     )
     # plot mask boundaries
-    if plot_bounds and "msk" not in ds:
+    if plot_bounds and "mask" not in ds:
         raise ValueError(
-            "No 'msk' (sfincs.msk) found in ds required to plot the model bounds "
-            "Set plot_bounds=False or add 'msk' to ds"
+            "No 'mask' (sfincs.mask) found in ds required to plot the model bounds "
+            "Set plot_bounds=False or add 'mask' to ds"
         )
     elif plot_bounds and isinstance(ds, xu.UgridDataset):
         raise NotImplementedError(
             "Plotting of the boundaries for quadtree grids is not yet implemented. "
             "Set plot_bounds=False to proceed."
         )
-    elif plot_bounds and (ds["msk"] >= 1).any():
-        gdf_msk = get_bounds_vector(ds["msk"])
+    elif plot_bounds and (ds["mask"] >= 1).any():
+        gdf_msk = get_bounds_vector(ds["mask"])
         gdf_msk2 = gdf_msk[gdf_msk["value"] == 2]
         gdf_msk3 = gdf_msk[gdf_msk["value"] == 3]
         if gdf_msk2.index.size > 0:
-            gdf_msk2.plot(ax=ax, zorder=3, label="waterlevel bnd", **geom_style["msk2"])
+            gdf_msk2.plot(
+                ax=ax, zorder=3, label="waterlevel bnd", **geom_style["mask2"]
+            )
         if gdf_msk3.index.size > 0:
-            gdf_msk3.plot(ax=ax, zorder=3, label="outflow bnd", **geom_style["msk3"])
+            gdf_msk3.plot(ax=ax, zorder=3, label="outflow bnd", **geom_style["mask3"])
 
     # plot static geoms
     if plot_geoms:
@@ -386,3 +398,7 @@ def plot_basemap(
         ax.legend(**legend_kwargs0)
 
     return fig, ax
+
+
+# %% DDB GUI focused additional functions:
+# FIXME - GUI overlay functions?

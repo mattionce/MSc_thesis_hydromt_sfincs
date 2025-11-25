@@ -12,14 +12,17 @@ import geopandas as gpd
 import copy
 
 from hydromt_sfincs import utils
-from hydromt_sfincs.sfincs_input import SfincsInput
 
 from .conftest import TESTMODELDIR
 
 
-def test_bin_map(tmpdir):
-    conf = SfincsInput.from_file(join(TESTMODELDIR, "sfincs.inp"))
-    shape = conf["nmax"], conf["mmax"]
+def test_bin_map(model_config, tmp_dir):
+    # get shape from config
+    nmax = model_config.config.get("nmax")
+    mmax = model_config.config.get("mmax")
+    shape = (nmax, mmax)
+
+    # read binary maps
     ind = utils.read_binary_map_index(join(TESTMODELDIR, "sfincs.ind"))
     msk = utils.read_binary_map(
         join(TESTMODELDIR, "sfincs.msk"), ind, shape=shape, dtype="u1", mv=0
@@ -27,18 +30,19 @@ def test_bin_map(tmpdir):
     assert [v in [0, 1, 2, 3] for v in np.unique(msk)]
     assert ind.max() == ind[-1]
 
-    fn_out = str(tmpdir.join("sfincs.ind"))
+    # write binary maps
+    fn_out = str(tmp_dir.joinpath("sfincs.ind"))
     utils.write_binary_map_index(fn_out, msk)
     ind1 = utils.read_binary_map_index(fn_out)
     assert np.all(ind == ind1)
 
-    fn_out = str(tmpdir.join("sfincs.msk"))
+    fn_out = str(tmp_dir.joinpath("sfincs.msk"))
     utils.write_binary_map(fn_out, msk, msk, dtype="u1")
     msk1 = utils.read_binary_map(fn_out, ind1, shape=shape, dtype="u1", mv=0)
     assert np.all(msk1 == msk1)
 
 
-def test_geoms(tmpdir, weirs):
+def test_geoms(tmp_dir, weirs):
     gdf = utils.linestring2gdf(weirs)
     assert gdf.index.size == len(weirs)
     assert np.all(gdf.geometry.type == "LineString")
@@ -58,9 +62,63 @@ def test_geoms(tmpdir, weirs):
     with pytest.raises(ValueError, match='"z" value missing'):
         utils.write_geoms("fail", [w], stype="weir")
     # test I/O
-    fn_out = str(tmpdir.join("test.weir"))
+    fn_out = str(tmp_dir.joinpath("test.weir"))
     utils.write_geoms(fn_out, weirs, stype="WEIR")
     weirs2 = utils.read_geoms(fn_out)
     weirs[1]["name"] = "WEIR02"  # a name is added when writing the file
     for i in range(len(weirs)):
         assert sorted(weirs2[i].items()) == sorted(weirs[i].items())
+
+
+@pytest.mark.parametrize(
+    "rotation, uv_points",
+    [
+        (0.0, True),
+        (0.0, False),
+        (15.0, True),
+        (15.0, False),
+    ],
+)
+def test_make_regular_grid(rotation, uv_points):
+    # grid parameters
+    x0 = 316200
+    y0 = 5051400.0
+    dx = dy = 200
+    mmin, nmin = 0, 0
+    mmax, nmax = 660, 460
+    refi = 10
+
+    # make a regular grid
+    da = utils.make_regular_grid(
+        x0=x0,
+        y0=y0,
+        dx=dx,
+        dy=dy,
+        mmin=mmin,
+        nmin=nmin,
+        mmax=mmax,
+        nmax=nmax,
+        refi=refi,
+        uv_points=uv_points,
+        rotation=rotation,
+    )
+    da_transform = da.raster.transform
+
+    # compute expected transform
+    transform, width, height = utils.make_regular_grid_transform(
+        x0=x0,
+        y0=y0,
+        dx=dx,
+        dy=dy,
+        mmin=mmin,
+        nmin=nmin,
+        mmax=mmax,
+        nmax=nmax,
+        refi=refi,
+        uv_points=uv_points,
+        rotation=rotation,
+    )
+
+    # assertions
+    np.testing.assert_allclose(da_transform, transform, atol=1e-8)
+    assert da.shape == (height, width)

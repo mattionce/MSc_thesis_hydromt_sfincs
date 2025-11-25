@@ -10,36 +10,78 @@ import numpy as np
 
 from hydromt import DataCatalog
 from hydromt_sfincs.sfincs import SfincsModel
-from hydromt_sfincs.regulargrid import RegularGrid
 
 TESTDATADIR = join(dirname(abspath(__file__)), "data")
 TESTMODELDIR = join(TESTDATADIR, "sfincs_test")
 
+local_data_yaml = join(TESTDATADIR, "local_data.yml")
+
 
 @pytest.fixture()
-def tmp_dir():
-    """Create and return a temporary directory.
-
-    Upon exiting the context, the directory and everything contained in it are removed.
-    """
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        yield Path(tmp_dir)
+def tmp_dir(tmp_path_factory):
+    return tmp_path_factory.mktemp("data")
 
 
 @pytest.fixture
-def reggrid():
-    # create a simple regular grid
-    grid = RegularGrid(
-        x0=318650,
-        y0=5040000,
-        dx=150,
-        dy=150,
-        nmax=84,  # height
-        mmax=36,  # width
-    )
-    return grid
+def data_catalog():
+    return DataCatalog("artifact_data")
 
 
+# initialize a model instance in write mode in a temporary directory
+@pytest.fixture
+def model_init(tmp_path):
+    mod = SfincsModel(root=tmp_path, mode="w+", data_libs=["artifact_data"])
+    return mod
+
+
+# initialize a model instance with configuration read
+@pytest.fixture
+def model_config():
+    root = TESTMODELDIR
+    mod = SfincsModel(root=root, mode="r", data_libs=["artifact_data", local_data_yaml])
+    mod.config.read()
+    return mod
+
+
+# read full model instance and set to write mode in a temporary directory
+@pytest.fixture
+def model(tmp_dir):
+    root = join(TESTDATADIR, "sfincs_test")
+    mod = SfincsModel(root=root, mode="r", data_libs=["artifact_data", local_data_yaml])
+    mod.read()
+    mod.root.set(tmp_dir, mode="r+")
+    return mod
+
+
+@pytest.fixture
+def quadtree_model(tmp_dir):
+    root = join(TESTDATADIR, "sfincs_test_quadtree")
+    mod = SfincsModel(root=root, mode="r")
+    mod.read()
+    mod.root.set(tmp_dir, mode="r+")
+    return mod
+
+
+# create a simple regular grid similar to sfincs_test
+@pytest.fixture
+def reggrid(model_config):
+    grid_params = {
+        "mmax": 36,
+        "nmax": 84,
+        "dx": 150,
+        "dy": 150,
+        "x0": 318650.0,
+        "y0": 5040000.0,
+        "rotation": 27.0,
+        "epsg": 32633,
+    }
+
+    # create the grid (note this actually calls model.reggrid.create)
+    model_config.grid.create(**grid_params)
+    return model_config.grid
+
+
+# create a random mask
 @pytest.fixture
 def mask(reggrid):
     # create a simple mask
@@ -66,20 +108,6 @@ def weirs():
         },
     ]
     return feats
-
-
-@pytest.fixture
-def mod(tmpdir):
-    root = TESTMODELDIR
-    mod = SfincsModel(root=root, mode="r")
-    mod.read()
-    mod.set_root(str(tmpdir), mode="r+")
-    return mod
-
-
-@pytest.fixture
-def data_catalog():
-    return DataCatalog("artifact_data")
 
 
 @pytest.fixture

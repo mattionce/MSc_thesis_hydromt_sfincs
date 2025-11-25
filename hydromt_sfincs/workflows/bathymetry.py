@@ -5,11 +5,13 @@ import logging
 import geopandas as gpd
 import numpy as np
 import xarray as xr
-from hydromt.gis_utils import nearest, parse_crs
 from scipy import ndimage
 from scipy.interpolate import interp1d
 from shapely.geometry import LineString, MultiLineString, MultiPoint, Point
 from shapely.ops import linemerge, snap, split, unary_union
+
+from hydromt.gis.gis_utils import parse_crs
+from hydromt.gis.vector_utils import nearest
 
 logger = logging.getLogger(__name__)
 
